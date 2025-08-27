@@ -95,7 +95,7 @@ def main(args):
                                                      gen_example_method = args.config['gen_example_method'],
                                                      return_data_index=True, seed=random.randint(0, 1e6))
             temp_demon_list.append((demon, split_demon, demon_data_index))
-
+  #          import pdb;pdb.set_trace()
             if args.config['demo_sample_method'] == 'random':
                 break
             else:
@@ -162,14 +162,36 @@ def main(args):
                 model_wrapper.reset_latent_dict()
 
         # generate context vector 
-        context_vector_dict = model_wrapper.get_context_vector(all_latent_dicts, args.config)
+        result = model_wrapper.get_context_vector(all_latent_dicts, args.config)
+        
+        # 检查是否返回了聚类结果（kmeans模式）
+        if isinstance(result, list) and len(result) == 2:
+            # kmeans模式：result = [context_vector_dict, cluster_dict]
+            context_vector_dict, cluster_dict = result
+            # 保存聚类结果
+            cluster_save_dict = {}
+            for layer, subdict in cluster_dict.items():
+                cluster_save_dict[layer] = {}
+                for module, cluster_result in subdict.items():
+                    cluster_save_dict[layer][module] = {
+                        'cluster': cluster_result['cluster'].cpu().numpy().tolist(),
+                        'index': cluster_result['index']
+                    }
+            with open(args.save_dir + '/cluster_dict.json', 'w') as f:
+                json.dump(cluster_save_dict, f, indent=4)
+            # 将聚类信息添加到context_vector_dict中，以便传递给inject_latent
+            context_vector_dict = [context_vector_dict, cluster_dict]
+        else:
+            # 正常模式：result = context_vector_dict
+            context_vector_dict = result
+            
         if args.config['gen_cv_method'] == 'noise':
             context_vector_dict = model_wrapper.init_noise_context_vector(context_vector_dict)
         del all_latent_dicts
             
         # calibrate context vector 
         s_t = time.time()
-        model_wrapper.calibrate_strength(context_vector_dict, cali_dataset, 
+        model_wrapper.calibrate_strength(result, cali_dataset, 
                                          args.config, save_dir=args.save_dir, 
                                          run_name=args.run_name)
         e_t = time.time()
@@ -184,8 +206,7 @@ def main(args):
         with torch.no_grad():
             with model_wrapper.inject_latent(context_vector_dict, args.config,
                                              model_wrapper.linear_coef):
-                test_ours_result = test_evaluator.evaluate(model_wrapper, tokenizer, demonstration='', 
-                                                           use_cache=args.config['use_cache'])
+                test_ours_result = test_evaluator.evaluate(model_wrapper, tokenizer, demonstration='', use_cache=args.config['use_cache'])
                 print(f'Test I2CL result: {test_ours_result}\n')
                 result_dict['test_result']['ours'].append(test_ours_result)
         e_t = time.time()
@@ -197,10 +218,24 @@ def main(args):
             json.dump(result_dict, f, indent=4)
 
         # save context vector dict
-        for layer, subdict in context_vector_dict.items():
-            for module, activation in subdict.items():
-                context_vector_dict[layer][module] = activation.cpu().numpy().tolist()
-        cv_save_dict[run_name] = context_vector_dict
+        if args.config['post_fuse_method'] == 'kmeans':
+            # kmeans模式：context_vector_dict是列表 [context_vector_dict, cluster_dict]
+            if isinstance(context_vector_dict, list):
+                # 只保存第一个元素（context_vector_dict）
+                save_dict = context_vector_dict[0]
+            else:
+                save_dict = context_vector_dict
+            # 保存context vector
+            for layer, subdict in save_dict.items():
+                for module, activation in subdict.items():
+                    save_dict[layer][module] = activation.cpu().numpy().tolist()
+            cv_save_dict[run_name] = save_dict
+        else:
+            # 正常模式
+            for layer, subdict in context_vector_dict.items():
+                for module, activation in subdict.items():
+                    context_vector_dict[layer][module] = activation.cpu().numpy().tolist()
+            cv_save_dict[run_name] = context_vector_dict
 
         with open(args.save_dir + '/cv_save_dict.json', 'w') as f:
             json.dump(cv_save_dict, f, indent=4)
@@ -258,3 +293,16 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
     print("All tasks completed.")
+# if __name__ == "__main__":
+#     # get args
+#     args = get_args()
+#     config = utils.load_config(args.config_path)
+#     model_name, dataset_name = config['models'][0], config['datasets'][0]
+
+#     input_args = argparse.Namespace()
+#     input_args.model_name = model_name
+#     input_args.dataset_name = dataset_name
+#     input_args.gpu = config['gpus'][0]
+#     input_args.config = copy.deepcopy(config)
+
+#     main(input_args)  # 单进程直接跑，pdb 就能用
