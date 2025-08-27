@@ -24,7 +24,8 @@ def set_seed(seed):
 
 def set_device(gpu_id):
     device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
-    torch.cuda.set_device(device)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(gpu_id))
     return device
 
 
@@ -34,8 +35,9 @@ def init_exp_path(args, exp_name, separate_dataset=True):
     else:
         save_dir = os.path.join(exp_name, args.model_name)
     args.save_dir = save_dir
-    if os.path.exists(save_dir) and 'debug' not in exp_name:
-        raise ValueError(f"Experiment {exp_name} already exists! please delete it or change the name!")
+    print(exp_name)
+    #if os.path.exists(save_dir) and 'debug' not in exp_name:
+     #   raise ValueError(f"Experiment {exp_name} already exists! please delete it or change the name! path is {save_dir}")
     os.makedirs(save_dir, exist_ok=True)
     # save config_dict
     with open(f'{save_dir}/config.json', 'w') as f:

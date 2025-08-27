@@ -16,7 +16,7 @@ class SST5(BaseTask):
         # class_num
         self.class_num = 5
         # load dataset
-        self.dataset = load_dataset('SetFit/sst5', split=load_split, keep_in_memory=True)
+        self.dataset = load_dataset('my_datasets/datasets/sst5', split=load_split, keep_in_memory=True)
         # get all data
         self.all_data = [data for data in self.dataset]
         # get all labels

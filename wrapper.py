@@ -66,15 +66,29 @@ class ModelWrapper(nn.Module):
         inject_pos = config['inject_pos']
         add_noise = config['add_noise']
         noise_scale = config['noise_scale']
+        cluster_info, cluster_index = None, None
+        is_using_cluster = config['is_using_cluster']
         try:
             # attach hook
             for layer_idx, layer in enumerate(self.inject_layers):
                 for module_idx, module in enumerate(config['module']):
-                    context_vector_container = [context_vector_dict[layer][module].to(self.device)]
+                    if inject_method == 'clustering':
+                        # 检查context_vector_dict是否为列表（kmeans模式）
+                        if isinstance(context_vector_dict, list) and len(context_vector_dict) == 2:
+                            context_vector_container = [context_vector_dict[0][layer][module].to(self.device)]
+                            cluster_info = context_vector_dict[1][layer][module]['cluster'].to(self.device)
+                            cluster_index = context_vector_dict[1][layer][module]['index']
+                        else:
+                            # 普通模式：context_vector_dict是字典，没有聚类信息
+                            context_vector_container = [context_vector_dict[layer][module].to(self.device)]
+                            cluster_info = None
+                            cluster_index = None
+                    else:
+                        context_vector_container = [context_vector_dict[layer][module].to(self.device)]
                     strength = linear_coef[layer_idx, module_idx, :]
                     inject_func = self.inject_hook_func(context_vector_container, strength,
                                                         inject_method, add_noise, noise_scale, 
-                                                        inject_pos, train_mode)
+                                                        inject_pos, train_mode, is_using_cluster, cluster_info, cluster_index, config)
                     handles.append(
                         self._get_nested_attr(self._get_arribute_path(layer, module)).
                         register_forward_hook(inject_func)
@@ -87,7 +101,7 @@ class ModelWrapper(nn.Module):
                 handle.remove()
 
     def inject_hook_func(self, context_vector_container, strength, inject_method,
-                         add_noise, noise_scale, inject_pos, train_mode=False):
+                         add_noise, noise_scale, inject_pos, train_mode=False, is_using_cluster=False, cluster_info=None, cluster_index=None, config=None):
 
         def hook_func(module, inputs, outputs):
             if type(outputs) is tuple:
@@ -95,9 +109,11 @@ class ModelWrapper(nn.Module):
             else:
                 output = outputs
             # init context_vector
+            # import pdb; pdb.set_trace()
             context_vector = context_vector_container[0]
             # expand inject_value to match output size (b, seq_len, d)
-            context_vector = context_vector.expand(output.size(0), output.size(1), context_vector.size(-1))
+            if inject_method != 'clustering':
+                context_vector = context_vector.expand(output.size(0), output.size(1), context_vector.size(-1))
             
             if inject_method == 'add':
                 output = output + F.relu(strength) * context_vector
@@ -125,6 +141,17 @@ class ModelWrapper(nn.Module):
             elif inject_method == 'balance':
                 a, b = strength[0], strength[1]
                 output = ((1.0 - a) * output + a * context_vector) * b
+            elif inject_method == 'clustering':
+                if cluster_info is None or cluster_index is None:
+                    raise ValueError("cluster_info or cluster_index is None!")
+                if context_vector.ndim != 2:
+                    raise ValueError("context_vector should be 2-dim tensor(nums_shot, dim) when using 'clustering' inject method!")
+                if inject_pos == 'all':
+                    
+                    context_vector = self._get_cluster_context_vector(output, context_vector, cluster_info, cluster_index, is_using_cluster)
+                    output = strength[1] * output + strength[0] * context_vector
+                else:
+                    raise ValueError("only support inject_pos: 'all' for 'clustering' inject method!")
             else:
                 raise ValueError("only support add, linear or balance!")
 
@@ -224,6 +251,9 @@ class ModelWrapper(nn.Module):
                 for module, latent_list in cur_dict.items():
                     cur_latent = torch.stack(latent_list, dim=0) # (layer_num, d)
                     ensemble_dict[module].append(cur_latent)
+            # 检查是否需要使用kmeans聚类
+            if config['post_fuse_method'] == 'kmeans':
+                return self._get_kmeans_cluster_result(all_latent_dicts, config, ensemble_dict)
 
             for module, latent_list in ensemble_dict.items():
                 if config['post_fuse_method'] == 'mean':
@@ -237,8 +267,14 @@ class ModelWrapper(nn.Module):
                     pca = utils.PCA(n_components=1).to(latents.device).fit(latents.float())
                     context_vector = (pca.components_.sum(dim=0, keepdim=True) + pca.mean_).mean(0)
                     ensemble_dict[module] = context_vector.view(layer_num, d)  # (layer_num, d)
+                elif config['post_fuse_method'] == 'svd':
+                    # 简单的SVD加权融合（支持前K个方向）
+                    svd_topk = config.get('svd_topk', None)
+                    context_vector = self._simple_svd_fusion(latent_list, topk=svd_topk)
+                    ensemble_dict[module] = context_vector
                 else:
-                    raise ValueError("Unsupported ensemble method!")
+                    raise ValueError("Unsupported ensemble method! Supported methods: mean, pca, svd, svd_ties")
+                   
             # reorganize ensemble_dict into layers
             layers = list(all_latent_dicts[0].keys())
             output_dict = {layer: {} for layer in layers} 
@@ -247,8 +283,269 @@ class ModelWrapper(nn.Module):
                     output_dict[layer][module] = context_vector[layer_idx, :].detach().to('cpu')  # (d)
 
         return output_dict
-    
 
+    def _get_kmeans_cluster_result(self, all_latent_dicts, config, ensemble_dict):
+        """
+        对所有example的token进行kmeans聚类，返回聚类结果
+        返回格式: [{layer 0: {module: context_vector}, layer 1: {...},}, 
+                   {layer 0: {module:{"cluster": tensor(k,dim), "index": [[1,2,3], ...]}}, ...}]
+        """
+        from sklearn.cluster import KMeans
+        
+        # 获取聚类参数
+        n_clusters = config.get('kmeans_n_clusters', 3)
+        random_state = config.get('kmeans_random_state', 42)
+        
+        # 第一个字典：正常的context vector（使用现有的ensemble_dict）
+        context_vector_dict = {}
+        # 第二个字典：聚类结果
+        cluster_dict = {}
+        
+        layers = list(all_latent_dicts[0].keys())
+        
+        for layer in layers:
+            context_vector_dict[layer] = {}
+            cluster_dict[layer] = {}
+            
+            for module in config['module']:
+                # 收集所有example的代表token向量进行聚类
+                example_vectors = []
+                for example_idx, latent_dict in enumerate(all_latent_dicts):
+                    latent_value = latent_dict[layer][module]  # (b, seq_len, d)
+                    batch_size, seq_len, dim = latent_value.shape
+                    
+                    # 根据tok_pos选择特定位置的向量
+                    if config['tok_pos'] == 'last':
+                        example_vector = latent_value[:, -1, :].squeeze()  # 取最后一个token
+                    elif config['tok_pos'] == 'first':
+                        example_vector = latent_value[:, 0, :].squeeze()   # 取第一个token
+                    elif config['tok_pos'] == 'random':
+                        example_vector = latent_value[:, random.randint(0, latent_value.size(1)), :].squeeze()  # 随机取一个token
+                    else:
+                        raise ValueError("only support last, first or random!")
+                    
+                    example_vectors.append(example_vector.detach().cpu().numpy())
+                
+                # 转换为numpy数组
+                all_tokens = np.array(example_vectors)  # (num_examples, dim)
+                
+                # 进行kmeans聚类
+                kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+                cluster_labels = kmeans.fit_predict(all_tokens)
+                cluster_centers = kmeans.cluster_centers_  # (n_clusters, dim)
+                
+                # 将所有example的向量堆叠，保持所有shots的向量
+                all_example_vectors = torch.stack([torch.tensor(vec) for vec in example_vectors], dim=0)  # (num_examples, dim)
+                context_vector_dict[layer][module] = all_example_vectors.detach().to('cpu')  # (num_examples, dim)
+                
+                # 组织聚类结果
+                cluster_result = {
+                    "cluster": torch.tensor(cluster_centers, dtype=torch.float32),  # (k, dim)
+                    "index": []
+                }
+                
+                # 按聚类组织index：每个聚类包含属于该聚类的example索引
+                cluster_indices = [[] for _ in range(n_clusters)]  # 为每个聚类创建空列表
+                for example_idx in range(len(all_latent_dicts)):
+                    cluster_label = cluster_labels[example_idx]  # 该example的代表token属于的聚类
+                    cluster_indices[cluster_label].append(example_idx)  # 将example索引添加到对应聚类
+                cluster_result["index"] = cluster_indices
+                
+                cluster_dict[layer][module] = cluster_result
+
+        # 将所有层的聚类结果写入一个文件
+        import os
+        import json
+        
+        # 创建输出目录
+        output_dir = "cluster_results"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 收集所有层的聚类结果
+        all_cluster_results = {}
+        
+        for layer in layers:
+            all_cluster_results[layer] = {}
+            for module in config['module']:
+                cluster_result = cluster_dict[layer][module]
+                
+                all_cluster_results[layer][module] = {
+                    "cluster_centers_shape": list(cluster_result['cluster'].shape),
+                    "cluster_assignment": cluster_result['index'],
+                    "cluster_details": {}
+                }
+                
+                for i, indices in enumerate(cluster_result['index']):
+                    all_cluster_results[layer][module]["cluster_details"][f"cluster_{i}"] = {
+                        "num_examples": len(indices),
+                        "example_indices": indices
+                    }
+        
+        # 保存到文件
+        filename = f"{output_dir}/all_layers_cluster_results.json"
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(all_cluster_results, f, indent=2, ensure_ascii=False)
+        
+        print(f"所有层的聚类结果已保存到: {filename}")
+        
+        # print(f"context_vector_dict: {context_vector_dict}")
+        # print(f"cluster_dict: {cluster_dict}")
+        return [context_vector_dict, cluster_dict]
+
+
+    def _simple_svd_fusion(self, latent_list, topk=None):
+        """
+        简单的SVD加权融合方法 - 只使用最大奇异值对应的方向
+        
+        Args:
+            latent_list: 形状为 (ensemble_num, layer_num, d) 的张量列表
+            
+        Returns:
+            context_vector: 形状为 (layer_num, d) 的融合后的上下文向量
+        """
+        # 添加调试信息
+        print(f"Debug - latent_list length: {len(latent_list)}")
+        print(f"Debug - latent_list[0] shape: {latent_list[0].shape}")
+        
+        # 将latent_list堆叠成张量
+        latents = torch.stack(latent_list, dim=0)  # (ensemble_num, layer_num, d)
+        print(f"Debug - latents shape: {latents.shape}")
+        ensemble_num, layer_num, d = latents.size()
+        print(f"Debug - ensemble_num: {ensemble_num}, layer_num: {layer_num}, d: {d}")
+        
+        # 为每一层单独计算SVD
+        context_vectors = []
+        for layer_idx in range(layer_num):
+            # 提取当前层的所有示范样本向量
+            layer_latents = latents[:, layer_idx, :]  # (ensemble_num, d)
+            
+            # 计算SVD（稳定版）
+            # --- 旧实现（保留备查） ---
+            # U, S, V = torch.svd(layer_latents.float())
+            # # 使用奇异值作为权重，加权组合右奇异向量
+            # weights = S / S.sum()  # 归一化权重 - 使用所有方向
+            # context_vector = torch.sum(V * weights.unsqueeze(0), dim=1)  # (d,)
+            # # 只使用最大奇异值对应的方向（第一个右奇异向量）
+            # # context_vector = V[:, 0]  # 取第一列，得到 (d,) 形状
+            # --- 新实现：先在系数空间融合，再映回特征空间 ---
+            U, S, Vh = torch.linalg.svd(layer_latents.float(), full_matrices=False)
+            V = Vh.t()  # (d, k)
+            # 系数矩阵：每个样本在共享基底 V 下的坐标 C = U Σ
+            C = U * S.unsqueeze(0)  # (n, k)
+            # 系数空间融合策略：均值；若指定 topk，仅使用前K个方向
+            if topk is not None:
+                k_use = min(int(topk), C.size(1))
+                C_use = C[:, :k_use]
+                V_use = V[:, :k_use]
+                c_merged = C_use.mean(dim=0)
+                context_vector = V_use @ c_merged
+            else:
+                c_merged = C.mean(dim=0)  # (k,)
+                context_vector = V @ c_merged  # (d,)
+            # 映回特征空间，得到该层的上下文向量
+            
+            context_vectors.append(context_vector)
+        
+        # 将所有层的上下文向量堆叠
+        final_context_vector = torch.stack(context_vectors, dim=0)  # (layer_num, d)
+        print(f"Debug - final_context_vector shape: {final_context_vector.shape}")
+        
+        return final_context_vector
+    
+    def _svd_ties_fusion(self, latent_list, tau=0.7, topk=None, agg='mean'):
+        """
+        重新实现的 TIES 融合：
+        - 逐层 SVD：X = U Σ V^T
+        - 系数空间 C = U * Σ
+        - 符号一致筛选：同号比例 >= tau 的维度保留
+        - 聚合：在保留维度上对系数做 mean/median
+        - 稀疏化：可选按幅值取前 topk 维
+        - 回到特征空间：v = V_sel @ c_merged
+        返回 shape (layer_num, d)
+        """
+        latents = torch.stack(latent_list, dim=0)  # (n, L, d)
+        n, L, d = latents.size()
+        vectors = []
+        for layer_idx in range(L):
+            X = latents[:, layer_idx, :].float()  # (n, d)
+            U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+            V = Vh.t()  # (d, r)
+            C = U * S.unsqueeze(0)  # (n, r)
+            # 符号一致筛选
+            agree = (torch.sign(C).sum(dim=0).abs() / n) >= float(tau)
+            if agree.any():
+                C_sel = C[:, agree]
+                V_sel = V[:, agree]
+            else:
+                C_sel = C
+                V_sel = V
+            # 聚合
+            c_merged = C_sel.median(dim=0).values if agg == 'median' else C_sel.mean(dim=0)
+            # 稀疏化
+            if topk is not None and c_merged.numel() > int(topk):
+                k_use = int(topk)
+                idx = torch.topk(c_merged.abs(), k_use, largest=True).indices
+                mask = torch.zeros_like(c_merged, dtype=torch.bool)
+                mask[idx] = True
+                c_merged = c_merged * mask
+                V_sel = V_sel[:, mask]
+            v = V_sel @ c_merged  # (d,)
+            vectors.append(v)
+        return torch.stack(vectors, dim=0)  # (L, d)
+    def _get_cluster_context_vector(self, output, context_vector, cluster_info, cluster_index, using_cluster=False):
+        """
+        Args:
+            output: (batch_size, seq_len, dim)
+            context_vector: (nums_shot, dim)
+            cluster_info: (k, dim)
+            cluster_index: list of list, len = k, each list contains indices of shots belonging to that cluster
+            using_cluster: bool, whether to use cluster centers or shots for weighting
+        Returns:
+            context_out: (batch_size, seq_len, dim)
+        """
+        batch_size, seq_len, dim = output.size()
+        k = cluster_info.size(0)
+
+        # 展平 output 方便计算 (batch_size*seq_len, dim)
+        output_flat = output.reshape(-1, dim)  # [N, d], N=batch_size*seq_len
+
+        # 计算距离: [N, k]
+        # 扩展维度后利用广播计算平方欧式距离
+        diff = output_flat.unsqueeze(1) - cluster_info.unsqueeze(0)  # [N, k, d]
+        dist = torch.norm(diff, dim=-1) + 1e-8  # [N, k]，避免除0
+
+        # 计算权重 = 距离倒数，归一化
+        weights = 1.0 / dist
+        weights = weights / weights.sum(dim=-1, keepdim=True)  # [N, k]
+        # 输出
+        print(f"聚类权重形状: {weights.shape}, 前3个token权重: {weights[:3].detach().cpu().numpy()}")
+
+        if using_cluster:
+            # 对 cluster_info 加权
+            context_flat = torch.matmul(weights, cluster_info)  # [N, d]
+        else:
+            # 对 shots 加权
+            # 构建 shot 权重矩阵: [N, nums_shot]
+            nums_shot = context_vector.size(0)
+            shot_weights = torch.zeros(output_flat.size(0), nums_shot, device=output.device)
+
+            for i, indices in enumerate(cluster_index):
+                if len(indices) == 0:
+                    continue
+                # 将 cluster 的权重平均分配给它的所有 shot
+                per_shot_w = weights[:, i].unsqueeze(1)  # [N, 1]
+                shot_weights[:, indices] += per_shot_w  # 广播加到对应 shots
+            shot_weights = shot_weights / (shot_weights.sum(dim=-1, keepdim=True) + 1e-8)
+            
+            # 输出
+            print(f"Shot权重形状: {shot_weights.shape}, 前3个token权重: {shot_weights[:3].detach().cpu().numpy()}")
+            
+            # 用 shot_weights 对 context_vector 加权
+            context_flat = torch.matmul(shot_weights, context_vector)  # [N, d]
+
+        # reshape 回 (batch_size, seq_len, dim)
+        context_out = context_flat.view(batch_size, seq_len, dim)
+        return context_out
     def calibrate_strength(self, context_vector_dict, dataset, config, 
                            save_dir=None, run_name=None):
         # prepare label dict          
@@ -463,10 +760,10 @@ class ModelWrapper(nn.Module):
 
         if config['inject_method'] == 'add':
             param_size = (layer_dim, len(config['module']), 1)  # (layer_num, module_num, 1)
-        elif config['inject_method'] in ['linear', 'balance']:
+        elif config['inject_method'] in ['linear', 'balance', 'clustering']:
             param_size = (layer_dim, len(config['module']), 2)  # (layer_num, module_num, 2)
         else:
-            raise ValueError("only support add, linear or balance!")
+            raise ValueError("only support add, linear, balance or clustering!")
         # set inject_layers
         self.inject_layers = layers
         # init linear_coef
