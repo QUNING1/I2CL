@@ -18,7 +18,15 @@ class AGNews(BaseTask):
         # class_num
         self.class_num = 4
         # load dataset
-        self.dataset = load_dataset('ag_news', split=load_split, keep_in_memory=True)
+        try:
+            self.dataset = load_dataset('my_datasets/datasets/ag_news', split=load_split, keep_in_memory=True)
+        except ConnectionError:
+            print("Network error, trying to load from cache...")
+            try:
+                self.dataset = load_dataset('my_datasets/datasets/ag_news', split=load_split, keep_in_memory=True, cache_dir='./cache')
+            except:
+                print("Failed to load ag_news dataset. Please check your internet connection or download the dataset manually.")
+                raise
         # get all data
         self.all_data = [data for data in self.dataset]
         # get all labels

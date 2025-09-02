@@ -13,7 +13,6 @@ import utils
 import my_datasets as md
 import evaluator as ev
 
-
 def main(args):
     # set global seed
     utils.set_seed(args.config['seed'])
@@ -139,10 +138,73 @@ def main(args):
             print(f'Test few-shot result: {test_fewshot_result}\n')
 
         # generate demon_list
+        # 根据数据集动态设置label2id
+        if args.dataset_name == 'agnews':
+            label2id = {
+                "World": 0,
+                "Sports": 1, 
+                "Business": 2,
+                "Technology": 3,
+            }
+        elif args.dataset_name == 'sst5':
+            label2id = {
+                "neutral": 0, 
+                "great": 1, 
+                "terrible": 2, 
+                "positive": 3, 
+                "negative": 4, 
+            }
+        elif args.dataset_name == 'trec':
+            label2id = {
+                "Abbreviation": 0,
+                "Entity": 1,
+                "Description": 2,
+                "Person": 3,
+                "Location": 4,
+                "Number": 5,
+            }
+        else:
+            # 默认使用SST5的标签
+            label2id = {
+                "neutral": 0, 
+                "great": 1, 
+                "terrible": 2, 
+                "positive": 3, 
+                "negative": 4, 
+            }
+        label_id_list = []
         demon_list = [demon]
         split_demon_list = split_demon
         result_dict['demon'][run_name] = demon_list
         result_dict['split_demon'][run_name] = split_demon_list
+
+        for d in split_demon_list:
+            # 根据数据集使用不同的标签提取逻辑
+            if args.dataset_name == 'agnews':
+                # AGNews格式: "News: {text}\nType: {label}"
+                if "Type:" in d:
+                    label_text = d.split("Type:")[-1].strip().split("\n")[0].strip()
+                    if label_text in label2id:
+                        label_id_list.append(label2id[label_text])
+            elif args.dataset_name == 'trec':
+                # TREC格式: "Question: {text}\nAnswer Type: {label}"
+                if "Answer Type:" in d:
+                    label_text = d.split("Answer Type:")[-1].strip().split("\n")[0].strip()
+                    if label_text in label2id:
+                        label_id_list.append(label2id[label_text])
+            else:
+                # SST5格式: 标签词在最后一个空格之后
+                if d.split(" ")[-1].split("\n")[0] in label2id:
+                    label_id_list.append(label2id[d.split(" ")[-1].split("\n")[0]])
+        
+        # 添加调试信息
+        print(f"Dataset: {args.dataset_name}")
+        print(f"split_demon_list length: {len(split_demon_list)}")
+        print(f"label_id_list length: {len(label_id_list)}")
+        if len(split_demon_list) > 0:
+            print(f"First demon: {repr(split_demon_list[0])}")
+        
+        assert len(label_id_list) == len(split_demon_list)
 
         # init strength_params
         model_wrapper.init_strength(args.config)
@@ -157,12 +219,14 @@ def main(args):
             for cur_demon in target_demon_list:
                 with model_wrapper.extract_latent():
                     demon_token = tokenizer(cur_demon, return_tensors='pt').to(args.device)
+                    # import pdb; pdb.set_trace()
                     _ = model(**demon_token)
                 all_latent_dicts.append(model_wrapper.latent_dict)
                 model_wrapper.reset_latent_dict()
 
         # generate context vector 
         result = model_wrapper.get_context_vector(all_latent_dicts, args.config)
+       # import pdb;pdb.set_trace()
         
         # 检查是否返回了聚类结果（kmeans模式）
         if isinstance(result, list) and len(result) == 2:
@@ -175,7 +239,8 @@ def main(args):
                 for module, cluster_result in subdict.items():
                     cluster_save_dict[layer][module] = {
                         'cluster': cluster_result['cluster'].cpu().numpy().tolist(),
-                        'index': cluster_result['index']
+                        'index': cluster_result['index'],
+                        'mean_purity': utils.mean_purity(cluster_result['index'], label_id_list)
                     }
             with open(args.save_dir + '/cluster_dict.json', 'w') as f:
                 json.dump(cluster_save_dict, f, indent=4)
@@ -189,17 +254,29 @@ def main(args):
             context_vector_dict = model_wrapper.init_noise_context_vector(context_vector_dict)
         del all_latent_dicts
             
-        # calibrate context vector 
-        s_t = time.time()
-        model_wrapper.calibrate_strength(result, cali_dataset, 
-                                         args.config, save_dir=args.save_dir, 
-                                         run_name=args.run_name)
-        e_t = time.time()
-        print(f'Calibration time: {e_t - s_t}')
-        result_dict['time']['calibrate'].append(e_t - s_t)
+        # calibrate context vector (skip for static_add)
+        if args.config['inject_method'] == 'static_add':
+            print('Static_add: skipping calibration, direct injection only.')
+            s_t = time.time()
+            # 只初始化strength参数，不进行训练
+            model_wrapper.init_strength(args.config)
+            e_t = time.time()
+            print(f'Static_add setup time: {e_t - s_t}')
+            result_dict['time']['calibrate'].append(e_t - s_t)
+        else:
+            s_t = time.time()
+            model_wrapper.calibrate_strength(result, cali_dataset, 
+                                             args.config, save_dir=args.save_dir, 
+                                             run_name=args.run_name)
+            e_t = time.time()
+            print(f'Calibration time: {e_t - s_t}')
+            result_dict['time']['calibrate'].append(e_t - s_t)
 
-        # save linear_coef
-        result_dict['linear_coef'][run_name] = model_wrapper.linear_coef.tolist()
+        # save linear_coef (static_add will be None)
+        if model_wrapper.linear_coef is not None:
+            result_dict['linear_coef'][run_name] = model_wrapper.linear_coef.tolist()
+        else:
+            result_dict['linear_coef'][run_name] = None
 
         # evaluate i2cl
         s_t = time.time()
@@ -250,6 +327,16 @@ def main(args):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config_path', type=str, default='configs/config_i2cl.py', help='path to config file')
+    parser.add_argument('--datasets', nargs='+', default=None, help='dataset name')
+    parser.add_argument('--inject_method', type=str, default=None, help='inject method')
+    parser.add_argument('--post_fuse_method', type=str, default=None, help='post fuse method')
+    parser.add_argument('--svd_topk', type=int, default=1, help='svd topk')
+    parser.add_argument('--kmeans_n_clusters', type=int, default=5, help='kmeans n clusters')
+    parser.add_argument('--kmeans_random_state', type=int, default=42, help='kmeans random state')
+    parser.add_argument('--query_pool_method', type=str, default='mean', help='query pool method')
+    parser.add_argument('--shot_per_class', type=int, default=5, help='shot per class')
+    parser.add_argument('--tok_pos', type=str, default='label', help='token position')
+
     return parser.parse_args()
 
 
@@ -259,6 +346,34 @@ if __name__ == "__main__":
     # load config
     config = utils.load_config(args.config_path)
     # Generate all combinations of models and datasets
+    # 自动生成exp_name格式: datasets_post_fuse_method_kmeans_n_clusters_inject_method_tok_pos_shot_per_class
+    exp_name_parts = [
+        args.datasets[0] if isinstance(args.datasets, list) else args.datasets,  # 取第一个数据集名称
+        args.post_fuse_method,
+        str(args.kmeans_n_clusters),
+        args.inject_method,
+        args.tok_pos,
+        str(args.shot_per_class)
+    ]
+    config['exp_name'] = '_'.join(exp_name_parts)
+    if args.datasets is not None:
+        config['datasets'] = args.datasets
+    if args.inject_method is not None:
+        config['inject_method'] = args.inject_method
+    if args.post_fuse_method is not None:
+        config['post_fuse_method'] = args.post_fuse_method
+    if args.svd_topk is not None:
+        config['svd_topk'] = args.svd_topk
+    if args.kmeans_n_clusters is not None:
+        config['kmeans_n_clusters'] = args.kmeans_n_clusters
+    if args.kmeans_random_state is not None:
+        config['kmeans_random_state'] = args.kmeans_random_state
+    if args.query_pool_method is not None:
+        config['query_pool_method'] = args.query_pool_method
+    if args.shot_per_class is not None:
+        config['shot_per_class'] = args.shot_per_class
+    if args.tok_pos is not None:
+        config['tok_pos'] = args.tok_pos
     combinations = list(itertools.product(config['models'], config['datasets']))
     # Queue to hold tasks
     task_queue = Queue()
@@ -297,6 +412,30 @@ if __name__ == "__main__":
 #     # get args
 #     args = get_args()
 #     config = utils.load_config(args.config_path)
+#     if args.exp_name is not None:
+#         config['exp_name'] = args.exp_name
+#     if args.models is not None:
+#         config['models'] = args.models
+#     if args.datasets is not None:
+#         config['datasets'] = args.datasets
+#     if args.bs is not None:
+#         config['bs'] = args.bs
+#     if args.inject_method is not None:
+#         config['inject_method'] = args.inject_method
+#     if args.init_value is not None:
+#         config['init_value'] = args.init_value
+#     if args.post_fuse_method is not None:
+#         config['post_fuse_method'] = args.post_fuse_method
+#     if args.svd_topk is not None:
+#         config['svd_topk'] = args.svd_topk
+#     if args.kmeans_n_clusters is not None:
+#         config['kmeans_n_clusters'] = args.kmeans_n_clusters
+#     if args.kmeans_random_state is not None:
+#         config['kmeans_random_state'] = args.kmeans_random_state
+#     if args.query_pool_method is not None:
+#         config['query_pool_method'] = args.query_pool_method
+#     if args.shot_per_class is not None:
+#         config['shot_per_class'] = args.shot_per_class
 #     model_name, dataset_name = config['models'][0], config['datasets'][0]
 
 #     input_args = argparse.Namespace()
@@ -304,5 +443,6 @@ if __name__ == "__main__":
 #     input_args.dataset_name = dataset_name
 #     input_args.gpu = config['gpus'][0]
 #     input_args.config = copy.deepcopy(config)
+#     import pdb; pdb.set_trace()
 
 #     main(input_args)  # 单进程直接跑，pdb 就能用

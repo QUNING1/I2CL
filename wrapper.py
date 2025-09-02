@@ -12,7 +12,7 @@ import global_vars as gv
 from peft import get_peft_model, PromptTuningConfig
 
 
-class ModelWrapper(nn.Module):
+class ModelWrapper(nn.Module):                                                                                                                                                            
     def __init__(self, model, tokenizer, model_config, device):
         super().__init__()
         self.model = model.eval()
@@ -72,20 +72,23 @@ class ModelWrapper(nn.Module):
             # attach hook
             for layer_idx, layer in enumerate(self.inject_layers):
                 for module_idx, module in enumerate(config['module']):
-                    if inject_method == 'clustering':
-                        # 检查context_vector_dict是否为列表（kmeans模式）
-                        if isinstance(context_vector_dict, list) and len(context_vector_dict) == 2:
-                            context_vector_container = [context_vector_dict[0][layer][module].to(self.device)]
-                            cluster_info = context_vector_dict[1][layer][module]['cluster'].to(self.device)
-                            cluster_index = context_vector_dict[1][layer][module]['index']
-                        else:
-                            # 普通模式：context_vector_dict是字典，没有聚类信息
-                            context_vector_container = [context_vector_dict[layer][module].to(self.device)]
-                            cluster_info = None
-                            cluster_index = None
+                    # 检查context_vector_dict是否为列表（kmeans模式）
+                    if isinstance(context_vector_dict, list) and len(context_vector_dict) == 2:
+                        context_vector_container = [context_vector_dict[0][layer][module].to(self.device)]
+                        cluster_info = context_vector_dict[1][layer][module]['cluster'].to(self.device)
+                        cluster_index = context_vector_dict[1][layer][module]['index']
                     else:
+                        # 普通模式：context_vector_dict是字典，没有聚类信息
                         context_vector_container = [context_vector_dict[layer][module].to(self.device)]
-                    strength = linear_coef[layer_idx, module_idx, :]
+                        cluster_info = None
+                        cluster_index = None
+                    
+                    # static_add方法不需要强度系数
+                    if inject_method == 'static_add':
+                        strength = None
+                    else:
+                        strength = linear_coef[layer_idx, module_idx, :]
+                    
                     inject_func = self.inject_hook_func(context_vector_container, strength,
                                                         inject_method, add_noise, noise_scale, 
                                                         inject_pos, train_mode, is_using_cluster, cluster_info, cluster_index, config)
@@ -111,12 +114,19 @@ class ModelWrapper(nn.Module):
             # init context_vector
             # import pdb; pdb.set_trace()
             context_vector = context_vector_container[0]
-            # expand inject_value to match output size (b, seq_len, d)
-            if inject_method != 'clustering':
+            
+            # 检查是否为kmeans模式（context_vector形状为(num_examples, dim)）
+            if context_vector.dim() == 2 and cluster_info is not None:
+                # kmeans模式：使用动态计算的context vector
+                context_vector = self._get_cluster_context_vector(output, context_vector, cluster_info, cluster_index, is_using_cluster, config)
+            else:
+                # 普通模式：expand inject_value to match output size (b, seq_len, d)
                 context_vector = context_vector.expand(output.size(0), output.size(1), context_vector.size(-1))
             
             if inject_method == 'add':
                 output = output + F.relu(strength) * context_vector
+            elif inject_method == 'static_add':
+                output = output + 0.1 * context_vector
             elif inject_method == 'linear':
                 if inject_pos == 'all':
                     output = strength[1] * output + strength[0] * context_vector
@@ -141,19 +151,8 @@ class ModelWrapper(nn.Module):
             elif inject_method == 'balance':
                 a, b = strength[0], strength[1]
                 output = ((1.0 - a) * output + a * context_vector) * b
-            elif inject_method == 'clustering':
-                if cluster_info is None or cluster_index is None:
-                    raise ValueError("cluster_info or cluster_index is None!")
-                if context_vector.ndim != 2:
-                    raise ValueError("context_vector should be 2-dim tensor(nums_shot, dim) when using 'clustering' inject method!")
-                if inject_pos == 'all':
-                    
-                    context_vector = self._get_cluster_context_vector(output, context_vector, cluster_info, cluster_index, is_using_cluster)
-                    output = strength[1] * output + strength[0] * context_vector
-                else:
-                    raise ValueError("only support inject_pos: 'all' for 'clustering' inject method!")
             else:
-                raise ValueError("only support add, linear or balance!")
+                raise ValueError("only support add, linear, balance or static_add!")
 
             if add_noise and train_mode:
                 # get l2_norm of output and use it as a scalar to scale noise, make sure no gradient
@@ -240,21 +239,19 @@ class ModelWrapper(nn.Module):
                         latent_value = sub_dict[module]  # (b, seq_len, d)  
                         if config['tok_pos'] == 'last':
                             latent_value = latent_value[:, -1, :].squeeze()
+                        elif config['tok_pos'] == 'label':
+                            latent_value = latent_value[:, -2, :].squeeze()  # 取倒数第二个token（标签词）
                         elif config['tok_pos'] == 'first':
                             latent_value = latent_value[:, 0, :].squeeze()
                         elif config['tok_pos'] == 'random':
                             latent_value = latent_value[:, random.randint(0, latent_value.size(1)), :].squeeze()
                         else:
-                            raise ValueError("only support last, first or random!")
+                            raise ValueError("only support last, label, first or random!")
                         cur_dict[module].append(latent_value)
 
                 for module, latent_list in cur_dict.items():
                     cur_latent = torch.stack(latent_list, dim=0) # (layer_num, d)
                     ensemble_dict[module].append(cur_latent)
-            # 检查是否需要使用kmeans聚类
-            if config['post_fuse_method'] == 'kmeans':
-                return self._get_kmeans_cluster_result(all_latent_dicts, config, ensemble_dict)
-
             for module, latent_list in ensemble_dict.items():
                 if config['post_fuse_method'] == 'mean':
                     context_vector = torch.stack(latent_list, dim=0).mean(dim=0)  # (layer_num, d)
@@ -272,8 +269,11 @@ class ModelWrapper(nn.Module):
                     svd_topk = config.get('svd_topk', None)
                     context_vector = self._simple_svd_fusion(latent_list, topk=svd_topk)
                     ensemble_dict[module] = context_vector
+                elif config['post_fuse_method'] == 'kmeans':
+                    # kmeans聚类方法，返回聚类结果
+                    return self._get_kmeans_cluster_result(all_latent_dicts, config, ensemble_dict)
                 else:
-                    raise ValueError("Unsupported ensemble method! Supported methods: mean, pca, svd, svd_ties")
+                    raise ValueError("Unsupported ensemble method! Supported methods: mean, pca, svd, kmeans")
                    
             # reorganize ensemble_dict into layers
             layers = list(all_latent_dicts[0].keys())
@@ -290,11 +290,36 @@ class ModelWrapper(nn.Module):
         返回格式: [{layer 0: {module: context_vector}, layer 1: {...},}, 
                    {layer 0: {module:{"cluster": tensor(k,dim), "index": [[1,2,3], ...]}}, ...}]
         """
-        from sklearn.cluster import KMeans
+        import numpy as np
+        import random
         
         # 获取聚类参数
         n_clusters = config.get('kmeans_n_clusters', 3)
         random_state = config.get('kmeans_random_state', 42)
+        max_iter = config.get('kmeans_max_iter', 100)
+        tol = config.get('kmeans_tol', 1e-4)
+        
+        from sklearn.cluster import KMeans
+        
+        def euclidean_kmeans(X, n_clusters, max_iter=100, tol=1e-4, random_state=42):
+            """
+            欧式距离KMeans聚类算法（回退到原始方法）
+            
+            Args:
+                X: (n_samples, n_features) 输入数据
+                n_clusters: 聚类数量
+                max_iter: 最大迭代次数
+                tol: 收敛阈值
+                random_state: 随机种子
+                
+            Returns:
+                cluster_centers: (n_clusters, n_features) 聚类中心
+                labels: (n_samples,) 聚类标签
+            """
+            kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10, max_iter=max_iter, tol=tol)
+            labels = kmeans.fit_predict(X)
+            centers = kmeans.cluster_centers_
+            return centers, labels
         
         # 第一个字典：正常的context vector（使用现有的ensemble_dict）
         context_vector_dict = {}
@@ -317,22 +342,24 @@ class ModelWrapper(nn.Module):
                     # 根据tok_pos选择特定位置的向量
                     if config['tok_pos'] == 'last':
                         example_vector = latent_value[:, -1, :].squeeze()  # 取最后一个token
+                    elif config['tok_pos'] == 'label':
+                        example_vector = latent_value[:, -2, :].squeeze()  # 取倒数第二个token（标签词）
                     elif config['tok_pos'] == 'first':
                         example_vector = latent_value[:, 0, :].squeeze()   # 取第一个token
                     elif config['tok_pos'] == 'random':
                         example_vector = latent_value[:, random.randint(0, latent_value.size(1)), :].squeeze()  # 随机取一个token
                     else:
-                        raise ValueError("only support last, first or random!")
+                        raise ValueError("only support last, label, first or random!")
                     
                     example_vectors.append(example_vector.detach().cpu().numpy())
                 
                 # 转换为numpy数组
                 all_tokens = np.array(example_vectors)  # (num_examples, dim)
                 
-                # 进行kmeans聚类
-                kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
-                cluster_labels = kmeans.fit_predict(all_tokens)
-                cluster_centers = kmeans.cluster_centers_  # (n_clusters, dim)
+                # 进行欧式距离kmeans聚类（回退到原始方法）
+                cluster_centers, cluster_labels = euclidean_kmeans(
+                    all_tokens, n_clusters, max_iter, tol, random_state
+                )
                 
                 # 将所有example的向量堆叠，保持所有shots的向量
                 all_example_vectors = torch.stack([torch.tensor(vec) for vec in example_vectors], dim=0)  # (num_examples, dim)
@@ -353,41 +380,6 @@ class ModelWrapper(nn.Module):
                 
                 cluster_dict[layer][module] = cluster_result
 
-        # 将所有层的聚类结果写入一个文件
-        import os
-        import json
-        
-        # 创建输出目录
-        output_dir = "cluster_results"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 收集所有层的聚类结果
-        all_cluster_results = {}
-        
-        for layer in layers:
-            all_cluster_results[layer] = {}
-            for module in config['module']:
-                cluster_result = cluster_dict[layer][module]
-                
-                all_cluster_results[layer][module] = {
-                    "cluster_centers_shape": list(cluster_result['cluster'].shape),
-                    "cluster_assignment": cluster_result['index'],
-                    "cluster_details": {}
-                }
-                
-                for i, indices in enumerate(cluster_result['index']):
-                    all_cluster_results[layer][module]["cluster_details"][f"cluster_{i}"] = {
-                        "num_examples": len(indices),
-                        "example_indices": indices
-                    }
-        
-        # 保存到文件
-        filename = f"{output_dir}/all_layers_cluster_results.json"
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(all_cluster_results, f, indent=2, ensure_ascii=False)
-        
-        print(f"所有层的聚类结果已保存到: {filename}")
-        
         # print(f"context_vector_dict: {context_vector_dict}")
         # print(f"cluster_dict: {cluster_dict}")
         return [context_vector_dict, cluster_dict]
@@ -492,7 +484,7 @@ class ModelWrapper(nn.Module):
             v = V_sel @ c_merged  # (d,)
             vectors.append(v)
         return torch.stack(vectors, dim=0)  # (L, d)
-    def _get_cluster_context_vector(self, output, context_vector, cluster_info, cluster_index, using_cluster=False):
+    def _get_cluster_context_vector(self, output, context_vector, cluster_info, cluster_index, using_cluster=False, config=None):
         """
         Args:
             output: (batch_size, seq_len, dim)
@@ -500,51 +492,68 @@ class ModelWrapper(nn.Module):
             cluster_info: (k, dim)
             cluster_index: list of list, len = k, each list contains indices of shots belonging to that cluster
             using_cluster: bool, whether to use cluster centers or shots for weighting
+            config: configuration dictionary for parameters
         Returns:
             context_out: (batch_size, seq_len, dim)
         """
         batch_size, seq_len, dim = output.size()
         k = cluster_info.size(0)
 
-        # 展平 output 方便计算 (batch_size*seq_len, dim)
-        output_flat = output.reshape(-1, dim)  # [N, d], N=batch_size*seq_len
+        # 使用mean-pooling获得query的全局表示，减少噪声
+        query_pool_method = config.get('query_pool_method', 'mean')  # 'mean', 'last', 'first', 'max'
+        
+        if query_pool_method == 'mean':
+            # Mean pooling: 对所有token取平均
+            query_repr = output.mean(dim=1)  # (batch_size, dim)
+        elif query_pool_method == 'last':
+            # Last token pooling: 使用最后一个token
+            query_repr = output[:, -1, :]  # (batch_size, dim)
+        elif query_pool_method == 'first':
+            # First token pooling: 使用第一个token
+            query_repr = output[:, 0, :]  # (batch_size, dim)
+        elif query_pool_method == 'max':
+            # Max pooling: 取每个维度的最大值
+            query_repr = output.max(dim=1)[0]  # (batch_size, dim)
+        else:
+            raise ValueError(f"Unsupported query_pool_method: {query_pool_method}")
 
-        # 计算距离: [N, k]
-        # 扩展维度后利用广播计算平方欧式距离
-        diff = output_flat.unsqueeze(1) - cluster_info.unsqueeze(0)  # [N, k, d]
-        dist = torch.norm(diff, dim=-1) + 1e-8  # [N, k]，避免除0
+        # 计算query表示与聚类中心的余弦相似度
+        query_norm = torch.norm(query_repr, p=2, dim=-1, keepdim=True)  # [batch_size, 1]
+        cluster_norm = torch.norm(cluster_info, p=2, dim=-1, keepdim=True)  # [k, 1]
+        
+        # 计算余弦相似度: [batch_size, k]
+        cosine_sim = torch.matmul(query_repr, cluster_info.t()) / (query_norm * cluster_norm.t() + 1e-8)
+        
+        # 将余弦相似度转换为距离（1 - 余弦相似度）
+        dist = 1.0 - cosine_sim  # [batch_size, k]
 
         # 计算权重 = 距离倒数，归一化
-        weights = 1.0 / dist
-        weights = weights / weights.sum(dim=-1, keepdim=True)  # [N, k]
-        # 输出
-        print(f"聚类权重形状: {weights.shape}, 前3个token权重: {weights[:3].detach().cpu().numpy()}")
+        weights = 1.0 / (dist + 1e-8)  # 避免除0
+        weights = weights / weights.sum(dim=-1, keepdim=True)  # [batch_size, k]
 
         if using_cluster:
-            # 对 cluster_info 加权
-            context_flat = torch.matmul(weights, cluster_info)  # [N, d]
+            # 对 cluster_info 加权（使用原始cluster_info，不是归一化后的）
+            context_per_query = torch.matmul(weights, cluster_info)  # [batch_size, d]
         else:
             # 对 shots 加权
-            # 构建 shot 权重矩阵: [N, nums_shot]
+            # 构建 shot 权重矩阵: [batch_size, nums_shot]
             nums_shot = context_vector.size(0)
-            shot_weights = torch.zeros(output_flat.size(0), nums_shot, device=output.device)
+            shot_weights = torch.zeros(batch_size, nums_shot, device=output.device)
 
             for i, indices in enumerate(cluster_index):
                 if len(indices) == 0:
                     continue
                 # 将 cluster 的权重平均分配给它的所有 shot
-                per_shot_w = weights[:, i].unsqueeze(1)  # [N, 1]
+                per_shot_w = weights[:, i].unsqueeze(1)  # [batch_size, 1]
                 shot_weights[:, indices] += per_shot_w  # 广播加到对应 shots
             shot_weights = shot_weights / (shot_weights.sum(dim=-1, keepdim=True) + 1e-8)
             
-            # 输出
-            print(f"Shot权重形状: {shot_weights.shape}, 前3个token权重: {shot_weights[:3].detach().cpu().numpy()}")
-            
             # 用 shot_weights 对 context_vector 加权
-            context_flat = torch.matmul(shot_weights, context_vector)  # [N, d]
+            context_per_query = torch.matmul(shot_weights, context_vector)  # [batch_size, d]
 
-        # reshape 回 (batch_size, seq_len, dim)
-        context_out = context_flat.view(batch_size, seq_len, dim)
+        # 将每个query的context vector广播到所有token
+        # context_per_query: [batch_size, d] -> [batch_size, 1, d] -> [batch_size, seq_len, d]
+        context_out = context_per_query.unsqueeze(1).expand(-1, seq_len, -1)
         return context_out
     def calibrate_strength(self, context_vector_dict, dataset, config, 
                            save_dir=None, run_name=None):
@@ -563,8 +572,14 @@ class ModelWrapper(nn.Module):
         for param in self.model.parameters():
             param.requires_grad = False
 
+        # get all_data
+        all_data = dataset.all_data
+        
+
+        
         # init optimizer
         optim_paramters = [{'params': self.linear_coef}]
+
         if config['optim'] == 'sgd':
             optimizer = torch.optim.SGD(optim_paramters, lr=config['lr'], 
                                         weight_decay=config['wd'])
@@ -575,12 +590,12 @@ class ModelWrapper(nn.Module):
             optimizer = torch.optim.Adam(optim_paramters, config['lr'])
         else:
             raise ValueError('optim must be sgd, adamW or adam!')
-
-        # get all_data
-        all_data = dataset.all_data
+        
+        # get epochs and batch_size from config
+        epochs = config['epochs']
+        batch_size = config['grad_bs']
         
         # init lr_scheduler
-        epochs, batch_size = config['epochs'], config['grad_bs']
         total_steps = epochs * len(all_data) // batch_size
         warmup_steps = int((0.05*epochs) * (len(all_data) // batch_size))
         lr_lambda = lambda step: min(1.0, step / warmup_steps) * (1 + math.cos(math.pi * step / total_steps)) / 2 \
@@ -760,10 +775,16 @@ class ModelWrapper(nn.Module):
 
         if config['inject_method'] == 'add':
             param_size = (layer_dim, len(config['module']), 1)  # (layer_num, module_num, 1)
-        elif config['inject_method'] in ['linear', 'balance', 'clustering']:
+        elif config['inject_method'] in ['linear', 'balance']:
             param_size = (layer_dim, len(config['module']), 2)  # (layer_num, module_num, 2)
+        elif config['inject_method'] == 'static_add':
+            # static_add不需要参数，但需要设置inject_layers
+            self.linear_coef = None
+            self.inject_layers = layers
+            print("static_add: no parameters needed")
+            return
         else:
-            raise ValueError("only support add, linear, balance or clustering!")
+            raise ValueError("only support add, linear, balance or static_add!")
         # set inject_layers
         self.inject_layers = layers
         # init linear_coef

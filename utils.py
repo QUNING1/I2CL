@@ -13,6 +13,16 @@ import matplotlib.pyplot as plt
 import wrapper
 import my_datasets as md 
 
+from collections import Counter
+def mean_purity(index, label_id_list):
+    purities = []
+    for cluster in index:
+        labels = [label_id_list[i] for i in cluster]
+        counter = Counter(labels)
+        dominant = counter.most_common(1)[0][1]  # 主导类别数量
+        purity = dominant / len(cluster)
+        purities.append(purity)
+    return sum(purities) / len(purities)
 
 def set_seed(seed):
     random.seed(seed)

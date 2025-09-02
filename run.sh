@@ -1,0 +1,1 @@
+python3 run_i2cl.py --exp_name exps/kmeans_shot_5_cls_5_add_0.1_trec --models models/meta-llama/Llama-2-7b-hf --datasets sst5 trec --bs 2 --inject_method static_add --init_value 0.1 1.0 --post_fuse_method mean --svd_topk 2 --kmeans_n_clusters 5 --kmeans_random_state 42 --query_pool_method mean --shot_per_class 5
