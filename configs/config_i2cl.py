@@ -6,9 +6,9 @@ import my_datasets as md
 config = {}
 # general
 config['exp_name'] = 'exps/kmeans_shot_5_cls_5_add_0.1_trec'
-config['gpus'] = ['0']
+config['gpus'] = ['2']
 # config['models'] = ['meta-llama/Llama-2-7b-hf']  # 'gpt2-xl', 'EleutherAI/gpt-j-6B'
-config['models'] = ['models/meta-llama/Llama-2-7b-hf/']
+config['models'] = ['models/llama-2-7b-hf/']
 # config['datasets'] = list(md.target_datasets.keys())
 config['datasets'] = ['trec']
 config['seed'] = 42
@@ -17,9 +17,9 @@ config['run_baseline'] = False  # whether run baseline #########################
 config['metric'] = 'acc'  # 'acc', 'macro_f1'
 config['bs'] = 2  # batch size
 config['load_in_8bit'] = False
-config['use_cache'] = True  # whether use kv cache
+config['use_cache'] = False  # whether use kv cache
 config['demo_sample_method'] = 'random' # 'random' or deficient
-
+config['share_example_weights'] = True
 # calibrate
 config['add_noise'] = True  # whether add noise
 config['noise_scale'] = 0.001  # noise scale
@@ -31,7 +31,7 @@ config['wd'] = 1e-3
 config['cali_example_method'] = 'normal' # 'normal', 'random_label'
 
 # context vector
-config['layer'] = 'all' # all, early, mid, late
+config['layer'] = [15] # all, early, mid, late
 config['tok_pos'] = 'label'  # 'random', 'first', 'last', 'label'#################################
 config['is_using_cluster'] = True
 config['inject_method'] = 'static_add'  # 'linear', 'constraint', 'add'
@@ -39,7 +39,7 @@ config['inject_pos'] = 'all'  # 'all', 'first', last', 'random'
 config['init_value'] = [0.1, 1.0]  # linear and constraint: [0.1, 1.0], add: [0.1]
 config['module'] = ['mlp', 'attn']  # 'mlp', 'attn', 'hidden'
 config['gen_cv_method'] = 'context'  # 'context', 'noise'
-config['post_fuse_method'] = 'kmeans'  # 'mean', 'pca', 'kmeans', 'svd'###############################
+config['post_fuse_method'] = 'sim'  # 'mean', 'pca', 'kmeans', 'svd'############################
 config['split_demon'] = True  # split demonstraiton into seperate examples
 config['gen_example_method'] = 'normal'  # 'normal', 'random_label', 'no_template', 'random_order'
 

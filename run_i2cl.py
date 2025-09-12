@@ -146,6 +146,11 @@ def main(args):
                 "Business": 2,
                 "Technology": 3,
             }
+        elif args.dataset_name == 'sst2':
+            label2id = {
+                "negative": 0,
+                "positive": 1,
+            }
         elif args.dataset_name == 'sst5':
             label2id = {
                 "neutral": 0, 
@@ -163,14 +168,50 @@ def main(args):
                 "Location": 4,
                 "Number": 5,
             }
-        else:
-            # 默认使用SST5的标签
+        elif args.dataset_name == 'mr':
             label2id = {
-                "neutral": 0, 
-                "great": 1, 
-                "terrible": 2, 
-                "positive": 3, 
-                "negative": 4, 
+                "negative": 0,
+                "positive": 1,
+            }
+        elif args.dataset_name == 'subj':
+            label2id = {
+                "objective": 0,
+                "subjective": 1,
+            }
+        elif args.dataset_name == 'dbpedia':
+            label2id = {
+                "company": 0,
+                "school": 1,
+                "artist": 2,
+                "athlete": 3,
+                "politics": 4,
+                "transportation": 5,
+                "building": 6,
+                "nature": 7,
+                "village": 8,
+                "animal": 9,
+                "plant": 10,
+                "album": 11,
+                "film": 12,
+                "book": 13,
+            }
+        elif args.dataset_name == 'hate_speech18':
+            label2id = {
+                "neutral": 0,
+                "hate": 1,
+            }
+        elif args.dataset_name == 'emo':
+            label2id = {
+                "others": 0,
+                "happy": 1,
+                "sad": 2,
+                "angry": 3,
+            }
+        else:
+            # 默认使用SST2的标签
+            label2id = {
+                "negative": 0,
+                "positive": 1,
             }
         label_id_list = []
         demon_list = [demon]
@@ -228,9 +269,9 @@ def main(args):
         result = model_wrapper.get_context_vector(all_latent_dicts, args.config)
        # import pdb;pdb.set_trace()
         
-        # 检查是否返回了聚类结果（kmeans模式）
+        # 检查是否返回了聚类结果（kmeans/hier模式）
         if isinstance(result, list) and len(result) == 2:
-            # kmeans模式：result = [context_vector_dict, cluster_dict]
+            # kmeans/hier模式：result = [context_vector_dict, cluster_dict]
             context_vector_dict, cluster_dict = result
             # 保存聚类结果
             cluster_save_dict = {}
@@ -295,8 +336,8 @@ def main(args):
             json.dump(result_dict, f, indent=4)
 
         # save context vector dict
-        if args.config['post_fuse_method'] == 'kmeans':
-            # kmeans模式：context_vector_dict是列表 [context_vector_dict, cluster_dict]
+        if args.config['post_fuse_method'] in ['kmeans', 'hier', 'sim']:
+            # kmeans/hier模式：context_vector_dict是列表 [context_vector_dict, cluster_dict]
             if isinstance(context_vector_dict, list):
                 # 只保存第一个元素（context_vector_dict）
                 save_dict = context_vector_dict[0]
@@ -355,7 +396,7 @@ if __name__ == "__main__":
         args.tok_pos,
         str(args.shot_per_class)
     ]
-    config['exp_name'] = '_'.join(exp_name_parts)
+    config['exp_name'] = 'exps/'+'_'.join(exp_name_parts) + '_mid'
     if args.datasets is not None:
         config['datasets'] = args.datasets
     if args.inject_method is not None:

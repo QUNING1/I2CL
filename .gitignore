@@ -8,3 +8,4 @@ figures/
 my_datasets/
 *.ipynb
 *.yaml
+logs/

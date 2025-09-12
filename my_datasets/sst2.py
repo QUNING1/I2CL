@@ -19,7 +19,7 @@ class SST2(BaseTask):
         # class_num
         self.class_num = 2
         # load dataset
-        self.dataset = load_dataset('glue', 'sst2', split=load_split, keep_in_memory=True)
+        self.dataset = load_dataset('my_datasets/datasets/stanfordnlp/sst2', split=load_split, keep_in_memory=True)
         # get all data
         self.all_data = [data for data in self.dataset]
         # get all labels

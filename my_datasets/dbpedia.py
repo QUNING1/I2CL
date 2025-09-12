@@ -4,6 +4,7 @@ except:
     from basetask import BaseTask
 # from basetask import BaseTask
 from datasets import load_dataset
+import os
 
 
 class DBPedia(BaseTask):
@@ -20,7 +21,19 @@ class DBPedia(BaseTask):
         # class_num
         self.class_num = 14
         # load dataset
-        self.dataset = load_dataset('fancyzhx/dbpedia_14', split=load_split, keep_in_memory=True)
+        # 原方式（保留注释）：
+        # self.dataset = load_dataset('my_datasets/datasets/fancyzhx/dbpedia_14/dbpedia_14', split=load_split, keep_in_memory=True)
+
+        # 新方式：直接从本地 parquet 文件加载，避免目录识别失败导致的 EmptyDatasetError
+        base_dir = os.path.join(os.path.dirname(__file__), 'datasets', 'fancyzhx', 'dbpedia_14', 'dbpedia_14')
+        data_files = {
+            'train': os.path.join(base_dir, 'train.parquet'),
+            'test': os.path.join(base_dir, 'test.parquet'),
+        }
+        if load_split == 'train':
+            self.dataset = load_dataset('parquet', data_files={'train': data_files['train']}, split='train', keep_in_memory=True)
+        else:
+            self.dataset = load_dataset('parquet', data_files={'test': data_files['test']}, split='test', keep_in_memory=True)
         # get all data
         self.all_data = [data for data in self.dataset]
         # get all labels
