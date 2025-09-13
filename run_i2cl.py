@@ -358,6 +358,37 @@ def main(args):
         with open(args.save_dir + '/cv_save_dict.json', 'w') as f:
             json.dump(cv_save_dict, f, indent=4)
 
+    # 计算所有run的均值
+    print("\n" + "="*30)
+    print("所有Run的均值统计:")
+    print("="*30)
+    
+    # 计算测试结果均值
+    if len(result_dict['test_result']['ours']) > 0:
+        ours_results = result_dict['test_result']['ours']
+        mean_acc = np.mean([r['acc'] for r in ours_results])
+        mean_f1 = np.mean([r['macro_f1'] for r in ours_results]) if 'macro_f1' in ours_results[0] else None
+        
+        print(f"平均准确率: {mean_acc:.4f}")
+        if mean_f1 is not None:
+            print(f"平均F1: {mean_f1:.4f}")
+        
+        # 保存均值到result_dict
+        result_dict['mean_results'] = {
+            'acc_mean': float(mean_acc),
+            'macro_f1_mean': float(mean_f1) if mean_f1 is not None else None
+        }
+    
+    print("="*30)
+    
+    # 保存包含均值的最终结果
+    with open(args.save_dir + '/result_dict.json', 'w') as f:
+        json.dump(result_dict, f, indent=4)
+    
+    # 单独保存均值结果
+    with open(args.save_dir + '/mean_results.json', 'w') as f:
+        json.dump(result_dict['mean_results'], f, indent=4)
+
     # delete all variables
     del model_wrapper, model, tokenizer, train_dataset, cali_dataset, test_dataset, holdout_dataset
     del test_evaluator, holdout_evaluator
@@ -396,7 +427,7 @@ if __name__ == "__main__":
         args.tok_pos,
         str(args.shot_per_class)
     ]
-    config['exp_name'] = 'exps/'+'_'.join(exp_name_parts) + '_mid'
+    config['exp_name'] = 'exps/'+'_'.join(exp_name_parts) 
     if args.datasets is not None:
         config['datasets'] = args.datasets
     if args.inject_method is not None:

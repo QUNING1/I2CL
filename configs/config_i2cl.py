@@ -6,7 +6,7 @@ import my_datasets as md
 config = {}
 # general
 config['exp_name'] = 'exps/kmeans_shot_5_cls_5_add_0.1_trec'
-config['gpus'] = ['2']
+config['gpus'] = ['3']
 # config['models'] = ['meta-llama/Llama-2-7b-hf']  # 'gpt2-xl', 'EleutherAI/gpt-j-6B'
 config['models'] = ['models/llama-2-7b-hf/']
 # config['datasets'] = list(md.target_datasets.keys())
@@ -19,7 +19,6 @@ config['bs'] = 2  # batch size
 config['load_in_8bit'] = False
 config['use_cache'] = False  # whether use kv cache
 config['demo_sample_method'] = 'random' # 'random' or deficient
-config['share_example_weights'] = True
 # calibrate
 config['add_noise'] = True  # whether add noise
 config['noise_scale'] = 0.001  # noise scale
@@ -31,7 +30,7 @@ config['wd'] = 1e-3
 config['cali_example_method'] = 'normal' # 'normal', 'random_label'
 
 # context vector
-config['layer'] = [15] # all, early, mid, late
+config['layer'] = 'all' # all, early, mid, late
 config['tok_pos'] = 'label'  # 'random', 'first', 'last', 'label'#################################
 config['is_using_cluster'] = True
 config['inject_method'] = 'static_add'  # 'linear', 'constraint', 'add'

@@ -23,8 +23,6 @@ class ModelWrapper(nn.Module):
         self.latent_dict = {}
         self.linear_coef = None
         self.inject_layers = None
-        # 缓存跨层共享的合成上下文（按 batch）
-        self._shared_cache = None
         print(f"The model has {self.num_layers} layers:")
 
     def reset_latent_dict(self):
@@ -71,8 +69,6 @@ class ModelWrapper(nn.Module):
         cluster_info, cluster_index = None, None
         is_using_cluster = config['is_using_cluster']
         try:
-            # 初始化共享权重缓存（一个注入会话内复用）
-            self._shared_cache = {"context_per_query": None}
             # attach hook
             for layer_idx, layer in enumerate(self.inject_layers):
                 for module_idx, module in enumerate(config['module']):
@@ -95,7 +91,7 @@ class ModelWrapper(nn.Module):
                     
                     inject_func = self.inject_hook_func(context_vector_container, strength,
                                                         inject_method, add_noise, noise_scale, 
-                                                        inject_pos, train_mode, is_using_cluster, cluster_info, cluster_index, config, layer)
+                                                        inject_pos, train_mode, is_using_cluster, cluster_info, cluster_index, config)
                     handles.append(
                         self._get_nested_attr(self._get_arribute_path(layer, module)).
                         register_forward_hook(inject_func)
@@ -106,11 +102,9 @@ class ModelWrapper(nn.Module):
             print(f"Removing {len(handles)} hooks...")
             for handle in handles:
                 handle.remove()
-            # 清理共享缓存
-            self._shared_cache = None
 
     def inject_hook_func(self, context_vector_container, strength, inject_method,
-                         add_noise, noise_scale, inject_pos, train_mode=False, is_using_cluster=False, cluster_info=None, cluster_index=None, config=None, layer_idx=None):
+                         add_noise, noise_scale, inject_pos, train_mode=False, is_using_cluster=False, cluster_info=None, cluster_index=None, config=None):
 
         def hook_func(module, inputs, outputs):
             if type(outputs) is tuple:
@@ -123,8 +117,8 @@ class ModelWrapper(nn.Module):
             
             # 检查是否为kmeans模式（context_vector形状为(num_examples, dim)）
             if context_vector.dim() == 2 and cluster_info is not None:
-                # 聚类/相似度模式：使用动态计算/或广播的context vector
-                context_vector = self._get_cluster_context_vector(output, context_vector, cluster_info, cluster_index, is_using_cluster, config, layer_idx)
+                # 聚类/相似度模式：使用动态计算的context vector
+                context_vector = self._get_cluster_context_vector(output, context_vector, cluster_info, cluster_index, is_using_cluster, config)
             else:
                 # 普通模式：expand inject_value to match output size (b, seq_len, d)
                 context_vector = context_vector.expand(output.size(0), output.size(1), context_vector.size(-1))
@@ -660,7 +654,7 @@ class ModelWrapper(nn.Module):
             v = V_sel @ c_merged  # (d,)
             vectors.append(v)
         return torch.stack(vectors, dim=0)  # (L, d)
-    def _get_cluster_context_vector(self, output, context_vector, cluster_info, cluster_index, using_cluster=False, config=None, layer_idx=None):
+    def _get_cluster_context_vector(self, output, context_vector, cluster_info, cluster_index, using_cluster=False, config=None):
         """
         Args:
             output: (batch_size, seq_len, dim)
@@ -693,56 +687,53 @@ class ModelWrapper(nn.Module):
         else:
             raise ValueError(f"Unsupported query_pool_method: {query_pool_method}")
 
-        # 当 share_example_weights=True 时，表示跨层广播：
-        # 在第一个被执行的注入层计算一次 context_per_query，缓存后其余层直接复用
-        share_weights = bool(config.get('share_example_weights', False))
+        # 计算query表示与聚类中心的余弦相似度
+        query_norm = torch.norm(query_repr, p=2, dim=-1, keepdim=True)  # [batch_size, 1]
+        cluster_norm = torch.norm(cluster_info, p=2, dim=-1, keepdim=True)  # [k, 1]
+        
+        # 计算余弦相似度: [batch_size, k]
+        cosine_sim = torch.matmul(query_repr, cluster_info.t()) / (query_norm * cluster_norm.t() + 1e-8)
+        
+        # 将余弦相似度转换为距离（1 - 余弦相似度）
+        dist = 1.0 - cosine_sim  # [batch_size, k]
 
-        # 若开启共享且已有缓存，直接复用
-        if share_weights and self._shared_cache is not None and self._shared_cache.get('context_per_query') is not None:
-            context_per_query = self._shared_cache['context_per_query'].to(output.device)
+        # 新方案：仅选最近簇，然后使用该簇内样本均值作为 in-context vector
+        # 找到最近簇索引（等价于 argmax cosine_sim）
+        best_cluster_idx = torch.argmax(cosine_sim, dim=-1)  # [batch_size]
+
+        if using_cluster:
+            # 使用最近簇中心
+            context_per_query = cluster_info[best_cluster_idx]
         else:
-            # 计算query表示与聚类中心的余弦相似度
-            query_norm = torch.norm(query_repr, p=2, dim=-1, keepdim=True)  # [batch_size, 1]
-            cluster_norm = torch.norm(cluster_info, p=2, dim=-1, keepdim=True)  # [k, 1]
-            cosine_sim = torch.matmul(query_repr, cluster_info.t()) / (query_norm * cluster_norm.t() + 1e-8)
-            dist = 1.0 - cosine_sim  # [batch_size, k]
+            # 预计算每个簇内样本均值
+            k = cluster_info.size(0)
+            means = []
+            for i in range(k):
+                idx = cluster_index[i]
+                if len(idx) == 0:
+                    # 空簇回退：用簇中心
+                    means.append(cluster_info[i].unsqueeze(0))
+                else:
+                    means.append(context_vector[idx].mean(dim=0, keepdim=True))
+            cluster_means = torch.cat(means, dim=0).to(output.device)  # [k, d]
+            context_per_query = cluster_means[best_cluster_idx]  # [batch_size, d]
 
-            weights = 1.0 / (dist + 1e-8)
-            weights = weights / weights.sum(dim=-1, keepdim=True)
-            if using_cluster:
-                context_per_query = torch.matmul(weights, cluster_info)
-            else:
-                nums_shot = context_vector.size(0)
-                shot_weights = torch.zeros(batch_size, nums_shot, device=output.device)
-                for i, indices in enumerate(cluster_index):
-                    if len(indices) == 0:
-                        continue
-                    per_shot_w = weights[:, i].unsqueeze(1)
-                    shot_weights[:, indices] += per_shot_w
-                shot_weights = shot_weights / (shot_weights.sum(dim=-1, keepdim=True) + 1e-8)
-                context_per_query = torch.matmul(shot_weights, context_vector)
+        # 原方案：对所有簇进行加权融合（已注释）
+        # weights = 1.0 / (dist + 1e-8)
+        # weights = weights / weights.sum(dim=-1, keepdim=True)
+        # if using_cluster:
+        #     context_per_query = torch.matmul(weights, cluster_info)
+        # else:
+        #     nums_shot = context_vector.size(0)
+        #     shot_weights = torch.zeros(batch_size, nums_shot, device=output.device)
+        #     for i, indices in enumerate(cluster_index):
+        #         if len(indices) == 0:
+        #             continue
+        #         per_shot_w = weights[:, i].unsqueeze(1)
+        #         shot_weights[:, indices] += per_shot_w
+        #     shot_weights = shot_weights / (shot_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        #     context_per_query = torch.matmul(shot_weights, context_vector)
 
-            # 若开启共享，将本次计算得到的 context_per_query 缓存，供其它层复用
-            if share_weights and self._shared_cache is not None:
-                self._shared_cache['context_per_query'] = context_per_query.detach()
-
-        # 注意：上面已根据 share_example_weights 开关/或当前层计算得到 context_per_query
-        # 下面不再重复使用 weights 以避免未定义引用
-            # # 预计算每个簇内样本均值
-            # k = cluster_info.size(0)
-            # means = []
-            # for i in range(k):
-            #     idx = cluster_index[i]
-            #     if len(idx) == 0:
-            #         # 空簇回退：用簇中心
-            #         means.append(cluster_info[i].unsqueeze(0))
-            #     else:
-            #         means.append(context_vector[idx].mean(dim=0, keepdim=True))
-            # cluster_means = torch.cat(means, dim=0).to(output.device)  # [k, d]
-            # context_per_query = cluster_means[best_cluster_idx]  # [batch_size, d]
-
-        # 将每个query的context vector广播到所有token
-        # context_per_query: [batch_size, d] -> [batch_size, 1, d] -> [batch_size, seq_len, d]
         context_out = context_per_query.unsqueeze(1).expand(-1, seq_len, -1)
         return context_out
     def calibrate_strength(self, context_vector_dict, dataset, config, 

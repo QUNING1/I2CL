@@ -12,12 +12,12 @@ mkdir -p logs
 mkdir -p results
  
 # 定义实验参数
-DATASETS=( "dbpedia" "mr" "subj" "sst5"   "dbpedia" "hate_speech18" "trec" "sst2" "sst5" "agnews")
+DATASETS=( "dbpedia" "mr" "subj" "sst5"  "hate_speech18" "trec" "sst2"  "agnews")
 SHOT_PER_CLASS=( 5 )
-KMEANS_CLUSTERS=( 5 )
+KMEANS_CLUSTERS=( 2 3 4 5 6 7 8 9 10 )
 INJECT_METHODS=("static_add")
-POST_FUSE_METHODS=("hier" )
-TOK_POS=("last" "label" )
+POST_FUSE_METHODS=("kmeans" )
+TOK_POS=( "label" )
 
 # 计数器
 EXPERIMENT_COUNT=0
@@ -92,3 +92,9 @@ echo "所有实验完成！"
 echo "结束时间: $(date)"
 echo "日志文件保存在 logs/ 目录"
 echo "结果文件保存在 results/ 目录"
+
+# 为每个数据集生成聚类数vs准确率图表
+echo "开始生成聚类数vs准确率图表..."
+python generate_cluster_plots.py
+
+echo "图表生成完成！"
