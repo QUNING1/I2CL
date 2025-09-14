@@ -306,9 +306,17 @@ def main(args):
             result_dict['time']['calibrate'].append(e_t - s_t)
         else:
             s_t = time.time()
-            model_wrapper.calibrate_strength(result, cali_dataset, 
-                                             args.config, save_dir=args.save_dir, 
-                                             run_name=args.run_name)
+            # 对于聚类模式，calibrate_strength需要的是context_vector_dict，不是result
+            if isinstance(result, list) and len(result) == 2:
+                # 聚类模式：传递context_vector_dict
+                model_wrapper.calibrate_strength(result[0], cali_dataset, 
+                                                 args.config, save_dir=args.save_dir, 
+                                                 run_name=args.run_name)
+            else:
+                # 正常模式：传递result
+                model_wrapper.calibrate_strength(result, cali_dataset, 
+                                                 args.config, save_dir=args.save_dir, 
+                                                 run_name=args.run_name)
             e_t = time.time()
             print(f'Calibration time: {e_t - s_t}')
             result_dict['time']['calibrate'].append(e_t - s_t)

@@ -74,7 +74,10 @@ class ModelWrapper(nn.Module):
                 for module_idx, module in enumerate(config['module']):
                     # 检查context_vector_dict是否为列表（kmeans模式）
                     if isinstance(context_vector_dict, list) and len(context_vector_dict) == 2:
-                        context_vector_container = [context_vector_dict[0][layer][module].to(self.device)]
+                        # 聚类模式：context_vector_dict[0][layer][module] 是 (num_examples, dim)
+                        # 我们需要取所有example的向量用于聚类
+                        all_example_vectors = context_vector_dict[0][layer][module].to(self.device)  # (num_examples, dim)
+                        context_vector_container = [all_example_vectors]
                         cluster_info = context_vector_dict[1][layer][module]['cluster'].to(self.device)
                         cluster_index = context_vector_dict[1][layer][module]['index']
                     else:
@@ -983,67 +986,4 @@ class ModelWrapper(nn.Module):
             for module, latent in sub_dict.items():
                 noise_vector = torch.randn_like(latent).detach().cpu()
                 context_vector_dict[layer][module] = noise_vector
-        return context_vector_dict
-            
-                    
-    def _get_nested_attr(self, attr_path):
-        """
-        Accesses nested attributes of an object based on a dot-separated string path.
-
-        :param obj: The object (e.g., a model).
-        :param attr_path: A dot-separated string representing the path to the nested attribute.
-                        For example, 'transformer.h' or 'model.layers'.
-        :return: The attribute at the specified path.
-        """
-        try:
-            return reduce(getattr, attr_path.split('.'), self.model)
-        except AttributeError:
-            raise AttributeError(f"Attribute path '{attr_path}' not found.")
-        
-    def _get_layer_num(self):
-        raise NotImplementedError("Please implement get_layer_num function for each model!")
-    
-    def _get_arribute_path(self, layer_idx, target_module):
-        raise NotImplementedError("Please implement get_arribute_path function for each model!")
-
-            
-class LlamaWrapper(ModelWrapper):
-    def __init__(self, model, tokenizer, model_config, device):
-        super().__init__(model, tokenizer, model_config, device)
-        self.embed_matrix = self.model.model.embed_tokens.weight.data
-        self.embed_dim = self.model_config.hidden_size
-        self.last_norm = self.model.model.norm
-        
-    def _get_layer_num(self):
-        return len(self.model.model.layers)
-    
-    def _get_arribute_path(self, layer_idx, target_module):
-        if target_module == "attn":
-            return f"model.layers.{layer_idx}.self_attn"
-        elif target_module == "mlp":
-            return f"model.layers.{layer_idx}.mlp"
-        elif target_module == "hidden":
-            return f"model.layers.{layer_idx}"
-        else:
-            raise ValueError("only support att or mlp!")
-
-
-class GPTWrapper(ModelWrapper):
-    def __init__(self, model, tokenizer, model_config, device):
-        super().__init__(model, tokenizer, model_config, device)
-        self.embed_matrix = self.model.transformer.wte.weight.data
-        self.embed_dim = self.embed_matrix.size(-1)
-        self.last_norm = self.model.transformer.ln_f
-        
-    def _get_layer_num(self):
-        return len(self.model.transformer.h)
-    
-    def _get_arribute_path(self, layer_idx, target_module):
-        if target_module == "attn":
-            return f"transformer.h.{layer_idx}.attn"
-        elif target_module == "mlp":
-            return f"transformer.h.{layer_idx}.mlp"
-        elif target_module == "hidden":
-            return f"transformer.h.{layer_idx}"
-        else:
-            raise ValueError("only support att or mlp!")
+        return 
