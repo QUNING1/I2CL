@@ -266,7 +266,7 @@ class ContextSolver:
                 raise warnings.warn('Global prefix or other str exists!')
         return list_s, match_before
 
-    def get_mask(self, input_ids, tokenizer=None):
+    def get_mask(self, input_ids, list_label=None, tokenizer=None):
         if isinstance(input_ids, list):
             input_ids = torch.tensor(input_ids)
         if len(input_ids.shape) == 2:
@@ -281,8 +281,25 @@ class ContextSolver:
         print('debug list_s:', list_s)
         print('debug match_before:', match_before)
         tensor_str_finder = TensorStrFinder(tokenizer=tokenizer)
-        mask = tensor_str_finder.get_strs_mask_in_tensor(list_s=list_s, t=input_ids,
-                                                         match_before=match_before)
+        mask = tensor_str_finder.get_strs_mask_in_tensor(list_s=list_s, t=input_ids, match_before=match_before)
+        # 将mask中为true的位置对应的input_id是在list_label中的，保留为true，其他为false
+        if list_label is not None:
+            list_label_ids = []
+            for label in list_label:
+                label_tokens = tokenizer(label, add_special_tokens=False)['input_ids']
+                list_label_ids.extend(label_tokens)
+            filtered_mask = torch.zeros_like(mask, dtype=torch.bool).to(input_ids.device)
+            for i in torch.where(mask)[0]:
+                if input_ids[i] in list_label_ids:
+                    filtered_mask[i] = True
+            num_tokens = len(input_ids)
+            # 确保至少有5个token，如果不足则检查所有token
+            start_idx = max(0, num_tokens - 4)
+            for i in range(start_idx, num_tokens):
+                if input_ids[i] in list_label_ids:
+                    filtered_mask[i] = True
+            mask = filtered_mask
+
         return mask
     
 
