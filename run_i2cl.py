@@ -272,7 +272,7 @@ def main(args):
         # 检查是否返回了聚类结果（kmeans/hier模式）
         if isinstance(result, list) and len(result) == 2:
             # kmeans/hier模式：result = [context_vector_dict, cluster_dict]
-            context_vector_dict, cluster_dict = result
+            cluster_dict = result[1]
             # 保存聚类结果
             cluster_save_dict = {}
             for layer, subdict in cluster_dict.items():
@@ -285,12 +285,11 @@ def main(args):
                     }
             with open(args.save_dir + '/cluster_dict.json', 'w') as f:
                 json.dump(cluster_save_dict, f, indent=4)
-            # 将聚类信息添加到context_vector_dict中，以便传递给inject_latent
-            context_vector_dict = [context_vector_dict, cluster_dict]
-        else:
-            # 正常模式：result = context_vector_dict
-            context_vector_dict = result
-            
+
+        # inject_latent里会判断是否是聚类模式
+        context_vector_dict = result
+
+        # TODO： init_noise_context_vector实现对聚类模式的判断
         if args.config['gen_cv_method'] == 'noise':
             context_vector_dict = model_wrapper.init_noise_context_vector(context_vector_dict)
         del all_latent_dicts
@@ -306,17 +305,14 @@ def main(args):
             result_dict['time']['calibrate'].append(e_t - s_t)
         else:
             s_t = time.time()
-            # 对于聚类模式，calibrate_strength需要的是context_vector_dict，不是result
-            if isinstance(result, list) and len(result) == 2:
-                # 聚类模式：传递context_vector_dict
-                model_wrapper.calibrate_strength(result[0], cali_dataset, 
-                                                 args.config, save_dir=args.save_dir, 
-                                                 run_name=args.run_name)
-            else:
-                # 正常模式：传递result
-                model_wrapper.calibrate_strength(result, cali_dataset, 
-                                                 args.config, save_dir=args.save_dir, 
-                                                 run_name=args.run_name)
+            # 是否为聚类模式，calibrate_strength中会调用inject_latent,会自动判断
+            model_wrapper.calibrate_strength(
+                context_vector_dict, 
+                cali_dataset, 
+                args.config, 
+                save_dir=args.save_dir, 
+                run_name=args.run_name
+            )
             e_t = time.time()
             print(f'Calibration time: {e_t - s_t}')
             result_dict['time']['calibrate'].append(e_t - s_t)
@@ -435,7 +431,7 @@ if __name__ == "__main__":
         args.tok_pos,
         str(args.shot_per_class)
     ]
-    config['exp_name'] = 'exps/'+'_'.join(exp_name_parts) 
+    config['exp_name'] = 'exps/train/label_top_1/'+'_'.join(exp_name_parts) 
     if args.datasets is not None:
         config['datasets'] = args.datasets
     if args.inject_method is not None:
